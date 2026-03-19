@@ -5,9 +5,9 @@ import newton
 import newton.examples
 import time  # 상단에 추가!
 
-from pendulum_balance import (
-    NewtonPendulumCfg,
-    NewtonPendulumBackend,
+from double_pendulum import (
+    CartDoublePoleCfg,
+    CartDoublePoleBackend,
 )  # 기존 훈련 스크립트에서 환경 설정과 백엔드 클래스를 임포트
 from rl_template import GenericRslRlEnv, make_train_cfg
 from rsl_rl.runners import OnPolicyRunner
@@ -35,16 +35,16 @@ def main():
     # 2. Warp 초기화 및 평가용 백엔드 설정
     wp.init()
 
-    backend_cfg = NewtonPendulumCfg()
+    backend_cfg = CartDoublePoleCfg()
     # 훈련 때는 2048개였지만, 눈으로 볼 때는 지정한 개수(기본 16개)만 생성
     backend_cfg.num_envs = args.num_envs
 
-    backend = NewtonPendulumBackend(backend_cfg, viewer=viewer)
+    backend = CartDoublePoleBackend(backend_cfg, viewer=viewer)
 
     # 3. RSL-RL 환경 설정 (훈련 때와 네트워크 크기가 완벽히 동일해야 함)
     train_cfg = make_train_cfg()
-    train_cfg["actor"]["hidden_dims"] = [64, 64]
-    train_cfg["critic"]["hidden_dims"] = [64, 64]
+    train_cfg["actor"]["hidden_dims"] = [128, 128]
+    train_cfg["critic"]["hidden_dims"] = [128, 128]
 
     env = GenericRslRlEnv(backend=backend, cfg=train_cfg)
 
