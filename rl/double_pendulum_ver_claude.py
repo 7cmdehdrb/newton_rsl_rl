@@ -18,13 +18,15 @@ class CartDoublePoleCfg:
     sim_substeps: int = 10
     max_steps: int = 1000
 
-    # 🔥 개선: 에이전트가 순간적으로 폭발적인 힘을 내어 보상할 수 있도록 한계치 대폭 상향
-    action_scale: float = 100.0  # (기존 10.0)
-    max_cart_vel: float = 100.0  # (기존 20.0)
-    max_cart_acc: float = 5000.0  # (기존 50.0) 거의 무제한에 가깝게 허용
+    # 🔥 공격적인 제어: 최대 목표 속도 3배 상향
+    action_scale: float = 30.0
 
-    # 트랙 물리적 한계
     track_limit: float = 10.0
+    joint_limit: float = 10.5  # prismatic joint 하드 한계 (obs 계산용)
+
+    # 🔥 속도·가속도 제한 사실상 제거
+    max_cart_vel: float = 100.0  # 기존 20.0
+    max_cart_acc: float = 1000.0  # 기존 50.0
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -46,8 +48,7 @@ class CartDoublePoleBackend(PhysicsBackend):
         self.sim_time = 0.0
 
         self._action_dim = 1
-        # 🔥 개선: 관측 차원 증가 (자세한 상태, 팁 위치, 트랙 여유분 등 추가)
-        self._obs_dim = 11
+        self._obs_dim = 15  # 🔥 6 → 15
 
         self.step_count = torch.zeros(
             self._num_envs, dtype=torch.long, device=self._device
@@ -67,8 +68,7 @@ class CartDoublePoleBackend(PhysicsBackend):
         newton.solvers.SolverMuJoCo.register_custom_attributes(base)
 
         cart_hx, cart_hy, cart_hz = 0.2, 0.1, 0.1
-        self.pole_hz = 0.5  # 길이 계산을 위해 저장
-        pole_hx, pole_hy, pole_hz = 0.05, 0.05, self.pole_hz
+        pole_hx, pole_hy, pole_hz = 0.05, 0.05, 0.5
 
         link_cart = base.add_link()
         base.add_shape_box(link_cart, hx=cart_hx, hy=cart_hy, hz=cart_hz)
@@ -158,9 +158,13 @@ class CartDoublePoleBackend(PhysicsBackend):
             device=self._device,
         )
 
+        self._truncated = torch.zeros(
+            self._num_envs, dtype=torch.bool, device=self._device
+        )
         self._has_been_upright = torch.zeros(
             self._num_envs, dtype=torch.bool, device=self._device
         )
+        self._upright_time = torch.zeros(self._num_envs, device=self._device)
 
         self.cmd_pos = torch.zeros(self._num_envs, device=self._device)
         self.cmd_vel = torch.zeros(self._num_envs, device=self._device)
@@ -190,6 +194,7 @@ class CartDoublePoleBackend(PhysicsBackend):
 
         target_vel = actions.squeeze(-1) * self.cfg.action_scale
 
+        # 🔥 max_cart_acc=1000 → max_dv=20 m/s/step: 사실상 즉각 응답
         max_dv = self.cfg.max_cart_acc * dt
         dv = torch.clamp(target_vel - self.cmd_vel, -max_dv, max_dv)
         self.cmd_vel = self.cmd_vel + dv
@@ -197,8 +202,8 @@ class CartDoublePoleBackend(PhysicsBackend):
         self.cmd_vel = torch.clamp(
             self.cmd_vel, -self.cfg.max_cart_vel, self.cfg.max_cart_vel
         )
-        self.cmd_pos = self.cmd_pos + self.cmd_vel * dt
 
+        self.cmd_pos = self.cmd_pos + self.cmd_vel * dt
         self.cmd_pos = torch.clamp(
             self.cmd_pos, -self.cfg.track_limit, self.cfg.track_limit
         )
@@ -292,19 +297,7 @@ class CartDoublePoleBackend(PhysicsBackend):
         self._terminated[env_ids] = False
         self._truncated[env_ids] = False
         self._has_been_upright[env_ids] = False
-
-    def _get_tip_position(self, q_pole1, q_pole2):
-        """순운동학(FK)을 통해 Base(카트 연결부) 대비 팁의 (x, z) 벡터를 구함"""
-        L1, L2 = self.pole_hz * 2.0, self.pole_hz * 2.0  # 각 폴의 길이는 1.0
-
-        # 절대 각도 계산
-        q_abs1 = q_pole1
-        q_abs2 = q_pole1 + q_pole2
-
-        tip_x = L1 * torch.sin(q_abs1) + L2 * torch.sin(q_abs2)
-        tip_z = L1 * torch.cos(q_abs1) + L2 * torch.cos(q_abs2)
-
-        return tip_x, tip_z, L1 + L2
+        self._upright_time[env_ids] = 0.0
 
     def _compute_reward_and_done(self):
         q_pt = wp.to_torch(
@@ -317,65 +310,88 @@ class CartDoublePoleBackend(PhysicsBackend):
         q_cart, q_pole1, q_pole2 = q_pt[:, 0], q_pt[:, 1], q_pt[:, 2]
         qd_cart, qd_pole1, qd_pole2 = qd_pt[:, 0], qd_pt[:, 1], qd_pt[:, 2]
 
-        # ----------------------------------------------------
-        # 1. Base -> Tip 벡터 수직 보상 (가장 핵심)
-        # ----------------------------------------------------
-        tip_x, tip_z, max_len = self._get_tip_position(q_pole1, q_pole2)
+        q_pole1_norm = (q_pole1 + torch.pi) % (2 * torch.pi) - torch.pi
+        q_pole2_abs = (q_pole1 + q_pole2 + torch.pi) % (2 * torch.pi) - torch.pi
 
-        # tip_z는 [-2.0, 2.0] 범위를 가짐. 수직일수록 2.0에 가까움
-        uprightness = tip_z / max_len  # [-1, 1]
+        abs_q1 = torch.abs(q_pole1_norm)
+        abs_q2 = torch.abs(q_pole2_abs)
 
-        # 기하급수적으로 설계하여 수직에 가까워질수록 보상이 급증하도록 설정
-        # 팁이 완전히 위를 보면 1.0, 누우면 거의 0에 수렴
-        reward_upright = torch.exp(3.0 * (uprightness - 1.0))
+        # ----------------------------------------------------------------
+        # 🔥 팁 벡터 계산 (prismatic base → pole2 tip)
+        #
+        #   pole1 단위벡터: (sin θ1,  cos θ1)  (length = 1.0)
+        #   pole2 단위벡터: (sin θ2a, cos θ2a) (length = 1.0, 절대각 기준)
+        #   tip_vec = pole1_vec + pole2_vec
+        #
+        #   tip_vz ∈ [-2, +2]
+        #     +2 : 두 폴 모두 완전 수직(위)
+        #     -2 : 두 폴 모두 완전 역방향(아래)
+        #
+        #   핵심: pole1이 살짝 기울고 pole2가 반대로 기울어도
+        #         합산 tip 벡터가 위를 향하면 양수 보상 → 유연한 스윙업
+        # ----------------------------------------------------------------
+        tip_vx = torch.sin(q_pole1_norm) + torch.sin(q_pole2_abs)
+        tip_vz = torch.cos(q_pole1_norm) + torch.cos(q_pole2_abs)  # [-2, 2]
 
-        # ----------------------------------------------------
-        # 2. 유지 보너스
-        # ----------------------------------------------------
-        # 팁이 충분히 높이(ex. 80% 이상) 올라갔는지 판단 (구부러져도 팁이 높으면 인정)
-        is_upright = tip_z > (max_len * 0.8)
+        tip_mag = torch.sqrt(tip_vx**2 + tip_vz**2 + 1e-6)
+        tip_cos_angle = tip_vz / tip_mag  # cos(tip 벡터와 수직축 사이 각) ∈ [-1, 1]
+
+        # ----------------------------------------------------------------
+        # 1. 스윙업 리워드: 팁 벡터 z 성분 기반
+        #    joint 각도를 개별로 보지 않고 tip 방향 하나로 통합 평가
+        # ----------------------------------------------------------------
+        reward_swing = tip_vz / 2.0  # [-1, 1]
+
+        # ----------------------------------------------------------------
+        # 2. 수직 상태 판별
+        # ----------------------------------------------------------------
+        is_upright = (abs_q1 < 0.4) & (abs_q2 < 0.4)
         self._has_been_upright = self._has_been_upright | is_upright
 
-        # 서 있을 때 멈춰있도록 유도
-        balance_bonus = (
-            is_upright.float() * 2.0 * torch.exp(-0.2 * (qd_pole1**2 + qd_pole2**2))
+        # ----------------------------------------------------------------
+        # 3. 밸런싱 보너스: 팁 벡터가 수직에 가까울수록 최대
+        #    - tip_cos_angle → 1 일수록 balance_accuracy → 1
+        #    - 하늘 방향일 때만 smooth gate (upright_gate) 로 활성화
+        #    - 각속도가 크면 불안정으로 간주, 지수적으로 감점
+        # ----------------------------------------------------------------
+        balance_accuracy = torch.exp(
+            -5.0 * (1.0 - tip_cos_angle).clamp(min=0)  # 수직 정렬 정밀도
+            - 0.05 * (qd_pole1**2 + qd_pole2**2)  # 각속도 안정화
         )
+        upright_gate = torch.clamp(tip_cos_angle, 0.0, 1.0) ** 2  # smooth, 위 방향만
+        balance_bonus = 10.0 * balance_accuracy * upright_gate
 
-        # ----------------------------------------------------
-        # 3. 가장자리 이탈 방지 및 중앙 복귀 유도
-        # ----------------------------------------------------
-        # 트랙 가장자리에 가까워질수록 강한 페널티
-        dist_to_edge = self.cfg.track_limit - torch.abs(q_cart)
-        edge_penalty = 0.5 * torch.exp(-dist_to_edge)
-        # 얕은 중앙 복귀 유도
-        center_penalty = 0.05 * (q_cart / self.cfg.track_limit) ** 2
+        reward = reward_swing + balance_bonus
 
-        # ----------------------------------------------------
-        # 4. 모터/카트 제어 페널티 (대폭 감소)
-        # ----------------------------------------------------
-        # 과도한 속도/액션 억제. 에이전트가 자유롭게 움직일 수 있도록 기존보다 크게 줄임
-        action_penalty = 0.0005 * (self.cmd_vel / self.cfg.action_scale) ** 2
+        # ----------------------------------------------------------------
+        # 4. 페널티 (공격적 제어 허용에 맞게 scaled)
+        # ----------------------------------------------------------------
+        cart_pos_penalty = 0.05 * (q_cart / self.cfg.track_limit) ** 2
+        cart_vel_penalty = 0.002 * (qd_cart / 30.0) ** 2
+        action_penalty = 0.003 * (self.cmd_vel / self.cfg.action_scale) ** 2
+
+        # 🔥 경계 접근 시 비선형 페널티: 2m 이내 접근하면 급격히 증가
+        boundary_margin = (self.cfg.track_limit - torch.abs(q_cart)).clamp(min=0)
+        boundary_penalty = 0.5 * torch.exp(-boundary_margin / 2.0)
 
         self._reward_buf = (
-            reward_upright
-            + balance_bonus
-            - center_penalty
-            - edge_penalty
+            reward
+            - cart_pos_penalty
+            - cart_vel_penalty
             - action_penalty
+            - boundary_penalty
         )
 
-        # ----------------------------------------------------
-        # 5. 터미네이션 (종료) 조건
-        # ----------------------------------------------------
+        # ----------------------------------------------------------------
+        # 5. 종료 조건 (overspeed 임계값 완화)
+        # ----------------------------------------------------------------
         is_out_of_bounds = torch.abs(q_cart) >= self.cfg.track_limit
         is_overspeed = (
-            (torch.abs(qd_cart) > 500.0)
-            | (torch.abs(qd_pole1) > 200.0)
-            | (torch.abs(qd_pole2) > 200.0)
+            (torch.abs(qd_cart) > 500.0)  # 기존 300 → 500
+            | (torch.abs(qd_pole1) > 150.0)  # 기존 100 → 150
+            | (torch.abs(qd_pole2) > 150.0)
         )
-
-        # 팁의 높이가 절반 밑으로 떨어지면 회복 불능으로 보고 가차없이 종료
-        is_fallen = tip_z < (max_len * 0.2)
+        is_fallen = (abs_q1 > 1.0) | (abs_q2 > 1.0)
         has_fallen_after_upright = self._has_been_upright & is_fallen
 
         self._terminated = is_out_of_bounds | is_overspeed | has_fallen_after_upright
@@ -392,23 +408,37 @@ class CartDoublePoleBackend(PhysicsBackend):
         q_cart, q_pole1, q_pole2 = q_pt[:, 0], q_pt[:, 1], q_pt[:, 2]
         qd_cart, qd_pole1, qd_pole2 = qd_pt[:, 0], qd_pt[:, 1], qd_pt[:, 2]
 
-        tip_x, tip_z, max_len = self._get_tip_position(q_pole1, q_pole2)
+        # 각도 정규화
+        q_pole1_norm = (q_pole1 + torch.pi) % (2 * torch.pi) - torch.pi
+        q_pole2_rel_norm = (q_pole2 + torch.pi) % (2 * torch.pi) - torch.pi  # 🔥 상대각
+        q_pole2_abs = (q_pole1 + q_pole2 + torch.pi) % (2 * torch.pi) - torch.pi
 
-        # 🔥 관측 11차원
+        # 🔥 팁 벡터 (normalized, ∈ [-1, 1])
+        tip_vx = (torch.sin(q_pole1_norm) + torch.sin(q_pole2_abs)) / 2.0
+        tip_vz = (torch.cos(q_pole1_norm) + torch.cos(q_pole2_abs)) / 2.0
+
+        # 🔥 joint 한계까지 거리 (normalized to [0, 1])
+        JLIM = self.cfg.joint_limit
+        dist_left = (q_cart + JLIM) / (2.0 * JLIM)
+        dist_right = (JLIM - q_cart) / (2.0 * JLIM)
+
         return torch.stack(
             [
-                q_cart
-                / self.cfg.track_limit,  # 1. 트랙 대비 현재 위치 (가장자리 인식용)
-                qd_cart / 10.0,  # 2. 카트 속도
-                torch.sin(q_pole1),  # 3. 폴1 각도 (sin)
-                torch.cos(q_pole1),  # 4. 폴1 각도 (cos)
-                torch.sin(q_pole2),  # 5. 폴2 각도 (sin)
-                torch.cos(q_pole2),  # 6. 폴2 각도 (cos)
-                qd_pole1 / 10.0,  # 7. 폴1 각속도
-                qd_pole2 / 10.0,  # 8. 폴2 각속도
-                tip_x / max_len,  # 9. 팁의 X축 오프셋
-                tip_z / max_len,  # 10. 팁의 Z축 높이 (가장 중요한 목표 정보)
-                self.cmd_vel / self.cfg.action_scale,  # 11. 현재 목표로 하는 속도명령
+                q_cart / self.cfg.track_limit,  # [0]  카트 위치 (normalized)
+                dist_left,  # [1]  🔥 왼쪽 joint 한계까지 거리
+                dist_right,  # [2]  🔥 오른쪽 joint 한계까지 거리
+                torch.cos(q_pole1_norm),  # [3]  pole1 cos
+                torch.sin(q_pole1_norm),  # [4]  pole1 sin
+                torch.cos(q_pole2_abs),  # [5]  pole2 절대각 cos
+                torch.sin(q_pole2_abs),  # [6]  pole2 절대각 sin
+                torch.cos(q_pole2_rel_norm),  # [7]  🔥 pole2 상대각 cos
+                torch.sin(q_pole2_rel_norm),  # [8]  🔥 pole2 상대각 sin
+                qd_cart / 30.0,  # [9]  카트 속도 (scaled)
+                qd_pole1 / 10.0,  # [10] pole1 각속도
+                qd_pole2 / 10.0,  # [11] pole2 각속도
+                self.cmd_vel / self.cfg.action_scale,  # [12] 🔥 명령 속도 (normalized)
+                tip_vx,  # [13] 🔥 팁 벡터 x (normalized)
+                tip_vz,  # [14] 🔥 팁 벡터 z (normalized)
             ],
             dim=-1,
         )
@@ -423,8 +453,19 @@ class CartDoublePoleBackend(PhysicsBackend):
         return self._truncated
 
     def episode_log(self) -> dict[str, Any]:
+        q_pt = wp.to_torch(
+            self.articulation_view.get_attribute("joint_q", self.state_0)
+        ).squeeze(1)
+        q_pole1, q_pole2 = q_pt[:, 1], q_pt[:, 2]
+        q_pole1_norm = (q_pole1 + torch.pi) % (2 * torch.pi) - torch.pi
+        q_pole2_abs = (q_pole1 + q_pole2 + torch.pi) % (2 * torch.pi) - torch.pi
+        tip_vz = torch.cos(q_pole1_norm) + torch.cos(q_pole2_abs)
+
         return {
             "/reward_mean": self._reward_buf.mean(),
+            "/tip_vz_mean": (tip_vz / 2.0).mean(),  # 🔥 팁 방향 모니터링
+            "/upright_ratio": self._has_been_upright.float().mean(),  # 🔥 세운 비율
+            "/terminated_ratio": self._terminated.float().mean(),  # 🔥 비정상 종료 비율
         }
 
 
@@ -441,8 +482,9 @@ def main():
     backend = CartDoublePoleBackend(backend_cfg, viewer=viewer)
 
     train_cfg = make_train_cfg()
-    train_cfg["actor"]["hidden_dims"] = [128, 128]
-    train_cfg["critic"]["hidden_dims"] = [128, 128]
+    # 🔥 obs 6→15로 확장되었으므로 네트워크 크기 증가
+    train_cfg["actor"]["hidden_dims"] = [256, 256, 128]
+    train_cfg["critic"]["hidden_dims"] = [256, 256, 128]
     train_cfg["save_interval"] = 50
 
     env = GenericRslRlEnv(backend=backend, cfg=train_cfg)
