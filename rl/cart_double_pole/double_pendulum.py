@@ -322,44 +322,40 @@ class CartDoublePoleBackend(PhysicsBackend):
         # ----------------------------------------------------
         tip_x, tip_z, max_len = self._get_tip_position(q_pole1, q_pole2)
 
-        # tip_z는 [-2.0, 2.0] 범위를 가짐. 수직일수록 2.0에 가까움
         uprightness = tip_z / max_len  # [-1, 1]
-
-        # 기하급수적으로 설계하여 수직에 가까워질수록 보상이 급증하도록 설정
-        # 팁이 완전히 위를 보면 1.0, 누우면 거의 0에 수렴
         reward_upright = torch.exp(3.0 * (uprightness - 1.0))
 
         # ----------------------------------------------------
         # 2. 유지 보너스
         # ----------------------------------------------------
-        # 팁이 충분히 높이(ex. 80% 이상) 올라갔는지 판단 (구부러져도 팁이 높으면 인정)
         is_upright = tip_z > (max_len * 0.8)
         self._has_been_upright = self._has_been_upright | is_upright
 
-        # 서 있을 때 멈춰있도록 유도
         balance_bonus = (
             is_upright.float() * 2.0 * torch.exp(-0.2 * (qd_pole1**2 + qd_pole2**2))
         )
 
         # ----------------------------------------------------
-        # 3. 가장자리 이탈 방지 및 중앙 복귀 유도
+        # 3. 가장자리 이탈 방지 및 🔥 중앙 복귀 유도 (수정됨)
         # ----------------------------------------------------
-        # 트랙 가장자리에 가까워질수록 강한 페널티
         dist_to_edge = self.cfg.track_limit - torch.abs(q_cart)
         edge_penalty = 0.5 * torch.exp(-dist_to_edge)
-        # 얕은 중앙 복귀 유도
-        center_penalty = 0.05 * (q_cart / self.cfg.track_limit) ** 2
+
+        # 🔥 개선: 누운 채로 중앙에 머무는 오판(Reward Hacking) 방지
+        # 폴이 80% 이상 서있을 때(is_upright)만 중앙 위치에 비례하여 보너스를 줍니다.
+        # q_cart가 0.0에 가까울수록 exp() 값이 1에 수렴하여 최대 0.5의 보너스를 받습니다.
+        center_bonus = is_upright.float() * 0.5 * torch.exp(-1.0 * torch.abs(q_cart))
 
         # ----------------------------------------------------
-        # 4. 모터/카트 제어 페널티 (대폭 감소)
+        # 4. 모터/카트 제어 페널티
         # ----------------------------------------------------
-        # 과도한 속도/액션 억제. 에이전트가 자유롭게 움직일 수 있도록 기존보다 크게 줄임
         action_penalty = 0.0005 * (self.cmd_vel / self.cfg.action_scale) ** 2
 
+        # 🔥 기존 center_penalty 대신 center_bonus 합산
         self._reward_buf = (
             reward_upright
             + balance_bonus
-            - center_penalty
+            + center_bonus
             - edge_penalty
             - action_penalty
         )
@@ -374,7 +370,6 @@ class CartDoublePoleBackend(PhysicsBackend):
             | (torch.abs(qd_pole2) > 200.0)
         )
 
-        # 팁의 높이가 절반 밑으로 떨어지면 회복 불능으로 보고 가차없이 종료
         is_fallen = tip_z < (max_len * 0.2)
         has_fallen_after_upright = self._has_been_upright & is_fallen
 
